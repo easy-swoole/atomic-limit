@@ -33,7 +33,7 @@ class Item
     public function setMax(int $max): void
     {
         $this->max = $max;
-        $this->atomic->set($max);
+        $this->atomic->set(0);
     }
 
     public function left():int
