@@ -3,76 +3,111 @@
 
 namespace EasySwoole\AtomicLimit;
 
-
 use EasySwoole\Component\Process\Config;
-use EasySwoole\Component\Singleton;
+use Swoole\Server;
+use Swoole\Table;
 
 class AtomicLimit
 {
-    use Singleton;
+    private $accessTable;
+    private $limitQps = 10;
+    private $gcInterval = 3;
+    private $hashAttach = false;
 
-    private $list = [];
-
-    function addItem(string $item):Item
+    public function __construct(int $maxToken = 1024*256)
     {
-        if(!isset($this->list[$item])){
-            $this->list[$item] = new Item($item);
-        }
-        return $this->list[$item];
+        //采样为近期3个秒
+        $this->accessTable = new Table($maxToken*3);
+        $this->accessTable->column('times',Table::TYPE_INT,4);
+        $this->accessTable->column('accessTime',Table::TYPE_INT,4);
+        $this->accessTable->create();
     }
 
-    public static function left(string $item):?int
+    /**
+     * @param int $limitQps
+     */
+    public function setLimitQps(int $limitQps): void
     {
-        $item = static::getInstance()->item($item);
-        if($item){
-            return $item->left();
-        }else{
+        $this->limitQps = $limitQps;
+    }
+
+    function access(string $token,?int $limitQps = null):?bool
+    {
+        if(!$this->hashAttach){
             return null;
         }
-    }
-
-    public static function isAllow(string $item):bool
-    {
-        $item = static::getInstance()->item($item);
-        if($item){
-            return $item->isAllow();
-        }else{
+        if($limitQps === null){
+            $limitQps = $this->limitQps;
+        }
+        $timePoint =  $n = time()%10;
+        $key = $this->hashKey($token,$timePoint);
+        $current = $this->accessTable->incr($key,'times',1);
+        $this->accessTable->set($key,['accessTime'=>time()]);
+        if($current > $limitQps){
             return false;
         }
-    }
-
-    public function restore(?string $item = null)
-    {
-        if($item){
-            $item = static::getInstance()->item($item);
-            if($item){
-                $item->restore();
-            }
-        }else{
-            foreach ($this->list as $item){
-                $item->restore();
-            }
+        if($current > $this->qps($token)){
+            return false;
         }
+        return  true;
     }
 
-    public function item(string $item):?Item
+    function qps(string $token):?float
     {
-        if(isset($this->list[$item])){
-            return $this->list[$item];
-        }else{
+        if(!$this->hashAttach){
             return null;
         }
+        $points = $this->getTimeBack2Point();
+        $count = 0;
+        $allTimes = 0;
+        foreach ($points as $point){
+            $key = $this->hashKey($token,$point);
+            $info = $this->accessTable->get($key);
+            if($info){
+                $count++;
+                $allTimes += $info['times'];
+            }
+        }
+        return round($allTimes/$count,2);
     }
 
-    public function enableProcessAutoRestore(\swoole_server $server,int $tick = 5*1000)
+    function attachServer(Server $server,string $serverName = 'EasysSwoole')
     {
-        $config = new Config();
-        $config->setArg([
-            'tick'=>$tick,
-            'manager'=>$this
+        $con = new Config();
+        $con->setArg([
+            'table'=>$this->accessTable,
+            'gcInterval'=>$this->gcInterval
         ]);
-        $config->setProcessName('AtomicLimit.AutoRestoreProcess');
-        $p = new Process($config);
+        $con->setProcessGroup("{$serverName}.AtomicLimit");
+        $con->setProcessName("{$serverName}.AtomicLimit.Worker");
+        $con->setEnableCoroutine(true);
+        $p = new Process($con);
         $server->addProcess($p->getProcess());
+        $this->hashAttach = true;
     }
+
+    /**
+     * @param float $gcInterval
+     */
+    public function setGcInterval(float $gcInterval): void
+    {
+        $this->gcInterval = $gcInterval;
+    }
+
+    private function getTimeBack2Point():array
+    {
+        $n = time()%10;
+        return [
+            $n,abs($n-1),abs($n - 2)
+        ];
+    }
+
+    private function hashKey(string $token,?int $timePoint = null):string
+    {
+        if($timePoint === null){
+            $timePoint = time()%10;
+        }
+        return substr(md5($token),8,16)."_{$timePoint}";
+    }
+
 }
