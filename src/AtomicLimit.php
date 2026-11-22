@@ -6,14 +6,11 @@ use Swoole\Atomic\Long;
 
 class AtomicLimit
 {
-    private const GC_BATCH_SIZE = 64;
-
     private $defaultQps;
     private $autoGc;
     private $gcIntervalNs;
     private $gcChangedAt;
     private $shards = [];
-    private $gcCursor;
 
     public function __construct(int $maxToken = 1024 * 256, int $lockerNum = 3)
     {
@@ -28,7 +25,6 @@ class AtomicLimit
         $this->autoGc = new Long(1);
         $this->gcIntervalNs = new Long(3000000000);
         $this->gcChangedAt = new Long(0);
-        $this->gcCursor = new Long(0);
         $shardCount = min($lockerNum, $maxToken);
         $capacity = intdiv($maxToken, $shardCount);
         $remainder = $maxToken % $shardCount;
@@ -88,18 +84,12 @@ class AtomicLimit
     {
         if ($key !== null) {
             $key = $this->hashKey($key);
-            return $this->shardFor($key)->gc($key, 1);
+            return $this->shardFor($key)->gc($key);
         }
 
-        $shardCount = count($this->shards);
-        $visited = min($shardCount, self::GC_BATCH_SIZE);
-        $budget = intdiv(self::GC_BATCH_SIZE, $visited);
-        $remainder = self::GC_BATCH_SIZE % $visited;
-        $start = ($this->gcCursor->add($visited === $shardCount ? 1 : $visited) - 1) % $shardCount;
         $removed = 0;
-        for ($offset = 0; $offset < $visited; $offset++) {
-            $shard = $this->shards[($start + $offset) % $shardCount];
-            $removed += $shard->gc(null, $budget + (int) ($offset < $remainder));
+        foreach ($this->shards as $shard) {
+            $removed += $shard->gc(null);
         }
         return $removed;
     }

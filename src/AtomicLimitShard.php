@@ -24,6 +24,7 @@ final class AtomicLimitShard
     private $lastLeaseToken;
     private $lastGcAt;
     private $scanStarted = false;
+    private $scanInProgress = false;
     private $maxToken;
 
     public function __construct(
@@ -183,24 +184,37 @@ final class AtomicLimitShard
         return $activeSeconds === 0 ? 0.0 : round(array_sum($samples) / $activeSeconds, 2);
     }
 
-    public function gc(?string $key, int $budget): int
+    public function gc(?string $key): int
     {
-        $lease = $this->tryAcquireLease();
-        if ($lease === null) {
-            return 0;
+        $keys = $key === null ? $this->candidateKeys(null) : [$key];
+        $nowNs = hrtime(true);
+        $defaults = $this->defaultRule();
+        $candidates = [];
+        foreach ($keys as $candidate) {
+            if ($this->needsReclaimCheck($candidate, $defaults, $nowNs)) {
+                $candidates[] = $candidate;
+            }
         }
 
-        try {
-            $defaults = $this->defaultRule();
-            $now = $this->now();
-            if ($key === null) {
-                return $this->collect($now, $defaults, $budget);
+        $removed = 0;
+        $total = count($candidates);
+        for ($offset = 0; $offset < $total; $offset += self::GC_BATCH_SIZE) {
+            $lease = $this->tryAcquireLease();
+            if ($lease === null) {
+                break;
             }
 
-            return (int) $this->reclaim($key, $defaults, $now);
-        } finally {
-            $this->releaseLease($lease);
+            try {
+                $now = $this->now();
+                $defaults = $this->defaultRule();
+                foreach (array_slice($candidates, $offset, self::GC_BATCH_SIZE) as $candidate) {
+                    $removed += (int) $this->reclaim($candidate, $defaults, $now);
+                }
+            } finally {
+                $this->releaseLease($lease);
+            }
         }
+        return $removed;
     }
 
     private function tryAcquireLease(): ?int
@@ -274,8 +288,7 @@ final class AtomicLimitShard
             // A rule can have changed while this bucket was idle. Discard unclaimed old batches.
             $batchAt = $nowNs;
         } else {
-            $period = ceil(1e9 / $bucket['refillRate']);
-            $period = $period >= PHP_INT_MAX ? PHP_INT_MAX : max(1, (int) $period);
+            $period = $this->refillPeriod($bucket['refillRate']);
             $batches = intdiv(max(0, $nowNs - $batchAt), $period);
             if ($batches >= 1) {
                 $tokens = max(0, $tokens);
@@ -330,24 +343,61 @@ final class AtomicLimitShard
 
     private function collect(float $now, array $defaults, int $budget, ?string $activeKey = null): int
     {
-        if (!$this->scanStarted || !$this->buckets->valid()) {
-            $this->buckets->rewind();
-            $this->scanStarted = true;
-        }
-
-        $candidates = [];
-        while (count($candidates) < $budget && $this->buckets->valid()) {
-            $candidates[] = $this->buckets->key();
-            $this->buckets->next();
-        }
-
         $removed = 0;
-        foreach ($candidates as $key) {
+        foreach ($this->candidateKeys($budget) as $key) {
             if ($key !== $activeKey && $this->reclaim($key, $defaults, $now)) {
                 $removed++;
             }
         }
         return $removed;
+    }
+
+    private function candidateKeys(?int $budget): array
+    {
+        // A Table iterator belongs to this worker and can be shared by its coroutines.
+        if ($this->scanInProgress) {
+            return [];
+        }
+        $this->scanInProgress = true;
+        try {
+            if ($budget === null || !$this->scanStarted || !$this->buckets->valid()) {
+                $this->buckets->rewind();
+                $this->scanStarted = true;
+            }
+
+            $keys = [];
+            while ($this->buckets->valid() && ($budget === null || count($keys) < $budget)) {
+                $keys[] = $this->buckets->key();
+                $this->buckets->next();
+            }
+            return $keys;
+        } finally {
+            $this->scanInProgress = false;
+        }
+    }
+
+    private function needsReclaimCheck(string $key, array $defaults, int $nowNs): bool
+    {
+        $bucket = $this->buckets->get($key);
+        if ($bucket === false) {
+            return false;
+        }
+
+        $rule = $this->rules->get($key) ?: $defaults;
+        if ($bucket['rate'] != $rule['rate'] || $bucket['capacity'] != $rule['capacity']) {
+            // Reconcile a changed default under the lease before judging capacity.
+            return true;
+        }
+
+        $period = $this->refillPeriod($bucket['refillRate']);
+        $batches = intdiv(max(0, $nowNs - $bucket['batchAt']), $period);
+        return $batches >= $rule['capacity'] - max(0, $bucket['tokens']);
+    }
+
+    private function refillPeriod(float $rate): int
+    {
+        $period = ceil(1e9 / $rate);
+        return $period >= PHP_INT_MAX ? PHP_INT_MAX : max(1, (int) $period);
     }
 
     private function reclaim(string $key, array $defaults, float $now): bool
