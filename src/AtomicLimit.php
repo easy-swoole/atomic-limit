@@ -1,113 +1,133 @@
 <?php
 
-
 namespace EasySwoole\AtomicLimit;
 
-use EasySwoole\Component\Process\Config;
-use Swoole\Server;
-use Swoole\Table;
+use Swoole\Atomic\Long;
 
 class AtomicLimit
 {
-    private $accessTable;
-    private $limitQps = 10;
-    private $gcInterval = 3;
-    private $hashAttach = false;
+    private const GC_BATCH_SIZE = 64;
 
-    public function __construct(int $maxToken = 1024*256)
+    private $defaultQps;
+    private $autoGc;
+    private $gcIntervalNs;
+    private $gcChangedAt;
+    private $shards = [];
+    private $gcCursor;
+
+    public function __construct(int $maxToken = 1024 * 256, int $lockerNum = 3)
     {
-        //采样为近期3个秒
-        $this->accessTable = new Table($maxToken*3);
-        $this->accessTable->column('times',Table::TYPE_INT,4);
-        $this->accessTable->column('accessTime',Table::TYPE_INT,4);
-        $this->accessTable->create();
+        if ($maxToken < 1) {
+            throw new \InvalidArgumentException('maxToken must be positive');
+        }
+        if ($lockerNum < 1) {
+            throw new \InvalidArgumentException('lockerNum must be positive');
+        }
+
+        $this->defaultQps = new Long(10);
+        $this->autoGc = new Long(1);
+        $this->gcIntervalNs = new Long(3000000000);
+        $this->gcChangedAt = new Long(0);
+        $this->gcCursor = new Long(0);
+        $shardCount = min($lockerNum, $maxToken);
+        $capacity = intdiv($maxToken, $shardCount);
+        $remainder = $maxToken % $shardCount;
+        for ($index = 0; $index < $shardCount; $index++) {
+            $this->shards[] = new AtomicLimitShard(
+                $capacity + (int) ($index < $remainder),
+                $this->defaultQps,
+                $this->autoGc,
+                $this->gcIntervalNs,
+                $this->gcChangedAt
+            );
+        }
     }
 
-    /**
-     * @param int $limitQps
-     */
+    public function setRule(string $token, float $rate, int $capacity): bool
+    {
+        if (!is_finite($rate) || $rate <= 0 || $capacity < 1) {
+            throw new \InvalidArgumentException('rate and capacity must be positive');
+        }
+
+        $key = $this->hashKey($token);
+        return $this->shardFor($key)->setRule($key, $rate, $capacity);
+    }
+
+    public function removeRule(string $token): bool
+    {
+        $key = $this->hashKey($token);
+        return $this->shardFor($key)->removeRule($key);
+    }
+
     public function setLimitQps(int $limitQps): void
     {
-        $this->limitQps = $limitQps;
+        if ($limitQps < 1) {
+            throw new \InvalidArgumentException('limitQps must be positive');
+        }
+
+        $this->defaultQps->set($limitQps);
     }
 
-    function access(string $token,?int $limitQps = null):?bool
+    public function access(string $token, ?int $limitQps = null): bool
     {
-        if(!$this->hashAttach){
-            return null;
-        }
-        if($limitQps === null){
-            $limitQps = $this->limitQps;
-        }
-        $timePoint =  $n = time()%10;
-        $key = $this->hashKey($token,$timePoint);
-        $current = $this->accessTable->incr($key,'times',1);
-        $this->accessTable->set($key,['accessTime'=>time()]);
-        if($current > $limitQps){
+        if ($limitQps !== null && $limitQps < 1) {
             return false;
         }
-        if($current > $this->qps($token)){
-            return false;
-        }
-        return  true;
+
+        $key = $this->hashKey($token);
+        return $this->shardFor($key)->access($key, $limitQps);
     }
 
-    function qps(string $token):?float
+    public function qps(string $token): float
     {
-        if(!$this->hashAttach){
-            return null;
-        }
-        $points = $this->getTimeBack2Point();
-        $count = 0;
-        $allTimes = 0;
-        foreach ($points as $point){
-            $key = $this->hashKey($token,$point);
-            $info = $this->accessTable->get($key);
-            if($info){
-                $count++;
-                $allTimes += $info['times'];
-            }
-        }
-        return round($allTimes/$count,2);
+        $key = $this->hashKey($token);
+        return $this->shardFor($key)->qps($key);
     }
 
-    function attachServer(Server $server,string $serverName = 'EasysSwoole')
+    public function gc(?string $key = null): int
     {
-        $con = new Config();
-        $con->setArg([
-            'table'=>$this->accessTable,
-            'gcInterval'=>$this->gcInterval
-        ]);
-        $con->setProcessGroup("{$serverName}.AtomicLimit");
-        $con->setProcessName("{$serverName}.AtomicLimit.Worker");
-        $con->setEnableCoroutine(true);
-        $p = new Process($con);
-        $server->addProcess($p->getProcess());
-        $this->hashAttach = true;
+        if ($key !== null) {
+            $key = $this->hashKey($key);
+            return $this->shardFor($key)->gc($key, 1);
+        }
+
+        $shardCount = count($this->shards);
+        $visited = min($shardCount, self::GC_BATCH_SIZE);
+        $budget = intdiv(self::GC_BATCH_SIZE, $visited);
+        $remainder = self::GC_BATCH_SIZE % $visited;
+        $start = ($this->gcCursor->add($visited === $shardCount ? 1 : $visited) - 1) % $shardCount;
+        $removed = 0;
+        for ($offset = 0; $offset < $visited; $offset++) {
+            $shard = $this->shards[($start + $offset) % $shardCount];
+            $removed += $shard->gc(null, $budget + (int) ($offset < $remainder));
+        }
+        return $removed;
     }
 
-    /**
-     * @param float $gcInterval
-     */
+    public function setAutoGc(bool $enabled): void
+    {
+        $this->autoGc->set((int) $enabled);
+    }
+
     public function setGcInterval(float $gcInterval): void
     {
-        $this->gcInterval = $gcInterval;
-    }
-
-    private function getTimeBack2Point():array
-    {
-        $n = time()%10;
-        return [
-            $n,abs($n-1),abs($n - 2)
-        ];
-    }
-
-    private function hashKey(string $token,?int $timePoint = null):string
-    {
-        if($timePoint === null){
-            $timePoint = time()%10;
+        if (!is_finite($gcInterval) || $gcInterval <= 0) {
+            throw new \InvalidArgumentException('gcInterval must be positive');
         }
-        return substr(md5($token),8,16)."_{$timePoint}";
+
+        $intervalNs = ceil($gcInterval * 1e9);
+        $this->gcChangedAt->set(hrtime(true));
+        $this->gcIntervalNs->set($intervalNs >= PHP_INT_MAX ? PHP_INT_MAX : (int) $intervalNs);
     }
 
+    private function hashKey(string $token): string
+    {
+        return substr(hash('sha256', $token), 0, 48);
+    }
+
+    private function shardFor(string $key): AtomicLimitShard
+    {
+        $index = hexdec(substr($key, 0, 8)) % count($this->shards);
+        return $this->shards[$index];
+    }
 }

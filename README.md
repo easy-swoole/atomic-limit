@@ -1,42 +1,114 @@
 # AtomicLimit
 
-Easyswoole提供了一个基于Atomic计数器的限流器。
-
-## 原理
-
-通过限制某一个时间周期内某个token的总请求数，从而实现基础限流。
+AtomicLimit 是一个基于 Swoole 共享内存的令牌桶限流器。多个 worker 共享限流状态，每个业务 key 可以独立设置补充速率和突发容量。令牌补充和分批回收都可以由请求触发。
 
 ## 安装
 
-```
+使用 64 位 PHP 和 Swoole 6.2.x。
+
+```sh
 composer require easyswoole/atomic-limit
 ```
 
-## 示例代码
+## 快速开始
 
-以经典的暴力CC攻击防护为例子。我们可以限制一个ip-url的qps访问。
+在启动 Swoole Server 前创建限流器。下面使用「客户端 IP + 请求路径」作为 key。默认每秒补 5 个令牌，最多存 5 个。本地访问 `/login` 的 key 可以存到 10 个，因此空闲后最多可以连续放行 10 次。
 
 ```php
+<?php
+
+require __DIR__ . '/vendor/autoload.php';
+
 use EasySwoole\AtomicLimit\AtomicLimit;
-$limit = new AtomicLimit();
+use Swoole\Http\Server;
 
-$http = new swoole_http_server("127.0.0.1", 9501);
-/** 为方便测试，限制设置为3 */
-$limit->setLimitQps(3);
-$limit->attachServer($http);
+$limiter = new AtomicLimit(4096);
+$limiter->setLimitQps(5);
 
-$http->on("request", function ($request, $response)use($http,$limit) {
-    $ip = $http->getClientInfo($request->fd)['remote_ip'];
-    $requestUri = $request->server['request_uri'];
-    $token = $ip.$requestUri;
-    /** access函数允许单独对某个token指定qps */
-    if($limit->access($token)){
-        $response->write('request accept');
-    }else{
-        $response->write('request refuse');
+if (!$limiter->setRule('127.0.0.1:/login', 5, 10)) {
+    throw new RuntimeException('Unable to configure the login rate limit');
+}
+
+$server = new Server('127.0.0.1', 9501);
+$server->on('request', function ($request, $response) use ($limiter) {
+    $key = $request->server['remote_addr'] . ':' . $request->server['request_uri'];
+
+    if (!$limiter->access($key)) {
+        $response->status(429);
+        $response->end('Too Many Requests');
+        return;
     }
-    $response->end();
+
+    $response->end('OK');
 });
 
-$http->start();
+$server->start();
 ```
+
+## 接口
+
+| 方法 | 行为 |
+| --- | --- |
+| `new AtomicLimit($maxToken = 262144, $lockerNum = 3)` | 活动桶和专属规则各有 `$maxToken` 的总配额。默认 3 个租约分片，实际分片数最多为 `$maxToken`。 |
+| `access($key): bool` | 每次成功放行消耗 1 个令牌。令牌不足、等待租约超时或桶表清理后仍无法插入时返回 `false`。 |
+| `setLimitQps($qps): void` | 设置全局默认补充速率和桶容量，两者都等于 `$qps`，初始值为 10。已有默认桶在下一次访问或回收检查时应用新配置。 |
+| `setRule($key, $rate, $capacity): bool` | 设置或更新该 key 的专属规则。`$rate` 为每秒补充的令牌数，支持正小数。`$capacity` 为桶最多能积攒的令牌数，必须是大于等于 1 的整数。满桶时可立即放行最多 `$capacity` 次请求，每次消耗 1 个令牌。已有桶先按旧规则结算，再按新容量截断余额。租约超时或规则无法写入时返回 `false`。 |
+| `removeRule($key): bool` | 删除专属规则，已有桶保留结算后的余额，并按默认容量截断。规则不存在或租约超时时返回 `false`。 |
+| `qps($key): float` | 取最近三个一秒时间片，对有请求的时间片计算平均尝试次数，包含记录在桶里的拒绝请求。无统计时返回 `0.0`，桶被回收时统计随之清除。 |
+| `setAutoGc($enabled): void` | 开关请求内自动回收，默认开启。设置对所有 worker 生效。 |
+| `setGcInterval($seconds): void` | 设置各分片请求内定期回收的间隔，默认 3 秒。 |
+| `gc(?string $key = null): int` | 指定 key 时只检查该桶。省略 key 时将最多 64 个检查名额分给各分片。返回实际回收的桶数。 |
+
+`access($key, $limitQps)` 的可选参数可进一步收紧本次可用余额，以及到下一次结算前的补充速率。运行时持久调整某个 key 的配置，使用 `setRule()`。例如把登录规则改成每秒补 2 个、最多存 4 个，可以调用 `setRule('127.0.0.1:/login', 2, 4)`。
+
+## 实现原理
+
+### 惰性补充与扣减
+
+每个活动 key 在 `Swoole\Table` 中有一行桶状态。A 是整数余额 `tokens`，B 是单调时钟上的批次进度 `batchAt`。新桶从满桶开始。
+
+1. 请求到来时，按补充速率和 B 计算已经到期的整枚令牌，补充后的余额以桶容量为上限。
+2. 先写 B 认领到期批次，再把令牌写入 A。worker 在两次写入之间退出，该次补充可能丢失，后续请求从已推进的 B 继续结算。
+3. 用 Table 的 `decr()` 原子扣减 A，结果大于等于 0 时放行。第一次对空桶扣减会得到 `-1`，后续请求在余额为负时直接拒绝。下次补充从 0 起算。
+
+### 分片与租约
+
+业务 key 按哈希分配到固定分片。每个分片有自己的桶表、规则表和 Atomic 租约。同一个 key 的访问、规则更新和回收使用同一把租约。不同分片的租约可以独立获取。
+
+租约用 `Swoole\Atomic\Long` 管理，每次获取都有唯一标识。争用时每隔 1 毫秒重试，协程等待期间让出执行。单个分片最多等待约 100 毫秒。正常释放和过期接管都用 CAS 比较所观察到的租约标识，旧调用的释放操作不会清掉新租约。
+
+租约有效期为 5 秒。持有者退出后，后续请求可在到期时接管，从桶现有状态继续结算。如果原 worker 只是卡住，接管后又恢复执行，两个 worker 可能并发写同一分片，导致状态覆盖或重复发放。
+
+### 分批回收与容量
+
+默认开启自动回收。请求只清理自己所属的分片。达到回收间隔时，推进扫描游标，每批最多检查 64 个候选桶，只删除按当前规则已补满的桶。新桶插入失败时立即清理一批并重试一次。回收会释放桶位，专属规则保留到调用 `removeRule()`。
+
+桶和专属规则各自的总配额平均分给各分片。例如 4096 个桶位分为 3 片，每个分片分到 1365 或 1366 个。哈希分布不均时，单个分片可能先满，当次插入只能使用该分片的空间。
+
+### 在自定义进程中回收
+
+在启动服务前调用 `$limiter->setAutoGc(false)`，让自定义进程使用同一个限流器实例，定时调用 `$limiter->gc()`。每次最多检查 64 个候选桶。关闭后，`access()` 跳过定期回收和插入失败时的回收重试。分片空间不足时，新 key 会返回 `false`，直到手动回收腾出空间。`setAutoGc(true)` 可重新开启请求内回收。
+
+## 压测性能
+
+在 Apple M2、macOS、PHP 8.4.27 和 Swoole 6.2.4 上进行本机压测。多个 PHP 进程直接调用 `access()`，每进程每轮 60,000 次，每组跑 3 轮。吞吐和尾延迟取各轮指标的中位数，延迟每 64 次调用采样一次。令牌额度设得足够高，以免正常限流影响测量。以下为开启自动回收时的组件调用数据，HTTP 服务的端到端吞吐和延迟需单独测量。
+
+### 默认 3 把租约
+
+| 负载 | 1 进程吞吐 | 2 进程吞吐 | 4 进程吞吐 | 8 进程吞吐 | 8 进程 P99 | 8 进程 P99.9 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 所有进程访问同一个已有 key | 40.61 万次/s | 41.83 万次/s | 42.34 万次/s | 42.57 万次/s | 3.29 µs | 9.07 ms |
+| 每个进程轮询各自的 128 个已有 key | 40.86 万次/s | 41.67 万次/s | 41.68 万次/s | 41.83 万次/s | 8.67 µs | 3.39 ms |
+| 128 槽桶表，持续插入新 key 并触发表满回收 | 31.54 万次/s | 31.84 万次/s | 32.10 万次/s | 32.51 万次/s | 112.08 µs | 4.53 ms |
+
+### 3 把与 6 把租约对比
+
+同一份代码交替测试两种配置。下表为 8 进程结果，箭头从 3 把指向 6 把。
+
+| 负载 | 吞吐（万次/s） | P99 | P99.9 |
+| --- | ---: | ---: | ---: |
+| 同一个已有 key | 42.57 → 42.02 | 3.29 → 3.33 µs | 9.07 → 9.07 ms |
+| 每进程轮询各自的 128 个已有 key | 41.83 → 42.21 | 8.67 µs → 1.12 ms | 3.39 → 3.37 ms |
+| 持续插入新 key 并触发回收 | 32.51 → 32.94 | 112.08 µs → 1.13 ms | 4.53 → 2.43 ms |
+
+本轮测试中，两种配置均未出现拒绝，所有场景的吞吐差异在 ±1.5% 内。6 把租约降低了 8 进程持续回收场景的 P99.9，但多 key 和持续回收的 P99 有所上升，因此默认值为 3。
